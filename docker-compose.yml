@@ -1,0 +1,157 @@
+version: '3.8'
+
+x-airflow-common:
+  &airflow-common
+  build: .
+  env_file:            # 👈 เพิ่มบรรทัดนี้
+    - .env
+  environment:
+    - AIRFLOW__CORE__EXECUTOR=LocalExecutor
+    - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:airflow@postgres/airflow
+    - AIRFLOW__CORE__LOAD_EXAMPLES=False
+    - AIRFLOW__CORE__LOAD_DEFAULT_CONNECTIONS=False
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./logs:/opt/airflow/logs
+    - ./plugins:/opt/airflow/plugins
+    - ./dbt_weather:/opt/airflow/dbt_weather
+  depends_on:
+    postgres:
+      condition: service_healthy
+
+services:
+  # ==========================================
+  # 1. PostgreSQL (Metadata Database สำหรับ Airflow)
+  # ==========================================
+  postgres:
+    image: postgres:13
+    environment:
+      - POSTGRES_USER=airflow
+      - POSTGRES_PASSWORD=airflow
+      - POSTGRES_DB=airflow
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    networks:
+      - data_stack_network
+
+  # ==========================================
+  # 2. MinIO (Data Lake - Bronze Layer)
+  # ==========================================
+  minio:
+    image: minio/minio
+    ports:
+      - "9000:9000" # API Port (เหมือน AWS S3)
+      - "9001:9001" # Web UI Console Port
+    environment:
+      - MINIO_ROOT_USER=admin
+      - MINIO_ROOT_PASSWORD=password123
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    networks:
+      - data_stack_network
+
+  # Service พิเศษสำหรับสร้าง Bucket 'weather-raw-data' แบบอัตโนมัติ
+  minio-setup:
+    image: minio/mc
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set myminio http://minio:9000 admin password123;
+      mc mb myminio/weather-raw-data --ignore-existing;
+      mc anonymous set public myminio/weather-raw-data;
+      exit 0;
+      "
+    networks:
+      - data_stack_network
+
+  # ==========================================
+  # 3. ClickHouse (Data Warehouse - Silver/Gold Layer)
+  # ==========================================
+  clickhouse:
+    image: clickhouse/clickhouse-server:latest
+    ports:
+      - "8123:8123" # HTTP Port (ใช้สำหรับเชื่อมต่อ dbt และ Power BI)
+      - "9002:9000" # Native Port (แมปออกมาเป็น 9002 เพื่อไม่ให้ชนกับ MinIO API)
+    environment:
+      - CLICKHOUSE_DB=weather_db
+      - CLICKHOUSE_USER=admin
+      - CLICKHOUSE_PASSWORD=admin
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - clickhouse_logs:/var/log/clickhouse-server
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    networks:
+      - data_stack_network
+
+  # ==========================================
+  # 4. Airflow (Orchestration Layer)
+  # ==========================================
+  airflow-init:
+    <<: *airflow-common
+    command: version
+    environment:
+      - AIRFLOW__CORE__EXECUTOR=LocalExecutor
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:airflow@postgres/airflow
+      - _AIRFLOW_DB_UPGRADE=true
+      - _AIRFLOW_WWW_USER_CREATE=true
+      - _AIRFLOW_WWW_USER_USERNAME=admin
+      - _AIRFLOW_WWW_USER_PASSWORD=admin
+    networks:
+      - data_stack_network
+
+  airflow-webserver:
+    <<: *airflow-common
+    command: webserver
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+    networks:
+      - data_stack_network
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+    networks:
+      - data_stack_network
+
+  metabase:
+    image: metabase/metabase:latest
+    ports:
+      - "3000:3000"
+    networks:
+      - data_stack_network
+volumes:
+  postgres_data:
+  minio_data:
+  clickhouse_data:
+  clickhouse_logs:
+
+networks:
+  data_stack_network:
+    driver: bridge

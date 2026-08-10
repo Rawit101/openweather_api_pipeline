@@ -1,0 +1,23 @@
+jaffle_shop:
+  target: dev
+  outputs:
+    dev:
+      type: bigquery
+      threads: 16
+      database: my-project-zaza-472404
+      schema: weather_project
+      method: service-account
+      keyfile: /Users/ssrawit/Documents/openweather_pipeline/python-bq-loader-key.json
+      location: US
+      dataproc_batch: null
+
+dbt_weather:
+  target: dev
+  outputs:
+    dev:
+      type: clickhouse
+      schema: weather_db
+      host: clickhouse
+      port: 8123
+      user: admin
+      password: admin
